@@ -84,26 +84,37 @@ def split_list(value):
 
 
 class Migrator:
-  def __init__(self, session, execute, remove_user):
+  def __init__(self, session, execute, remove_user, save_plan=None):
     self.s = session
     self.execute = execute
     self.remove_user = remove_user
+    self.save_plan = save_plan
     self.template_settings = None
 
   def write(self, desc, method, url, json=None, ok_statuses=(200, 201, 204),
-            already_statuses=()):
-    """Perform (or in dry-run, print) a mutating API call."""
+            already_statuses=(), retry_statuses=(), attempts=6):
+    """Perform (or in dry-run, print) a mutating API call.
+
+    retry_statuses: transient codes to retry (a just-created group can 404
+    or even 403 from some endpoints until it propagates)."""
     if not self.execute:
       print(f'    would: {desc}')
       return True
-    r = self.s.request(method, url, json=json)
-    if r.status_code in ok_statuses:
-      print(f'    done:  {desc}')
-      return True
-    if r.status_code in already_statuses:
-      print(f'    skip:  {desc} (already done: HTTP {r.status_code})')
-      return True
-    print(f'    FAIL:  {desc} -> HTTP {r.status_code}: {r.text[:300]}')
+    for attempt in range(attempts):
+      r = self.s.request(method, url, json=json)
+      if r.status_code in ok_statuses:
+        print(f'    done:  {desc}')
+        return True
+      if r.status_code in already_statuses:
+        print(f'    skip:  {desc} (already done: HTTP {r.status_code})')
+        return True
+      if r.status_code in retry_statuses and attempt < attempts - 1:
+        print(f'    ...HTTP {r.status_code} on "{desc}", retrying '
+              f'({attempt + 1}/{attempts})')
+        time.sleep(10)
+        continue
+      print(f'    FAIL:  {desc} -> HTTP {r.status_code}: {r.text[:300]}')
+      return False
     return False
 
   def get_template_settings(self):
@@ -113,6 +124,40 @@ class Migrator:
       self.template_settings = {k: v for k, v in r.json().items()
                                 if k not in SETTINGS_SKIP}
     return self.template_settings
+
+  def remove_user_aliases(self, uid, targets):
+    """Delete aliases from the user, retrying while the just-renamed
+    primary materializes as an alias. Returns True when none of the
+    target addresses remain attached to the user."""
+    targets = [t.lower() for t in targets]
+    if not self.execute:
+      for a in targets:
+        print(f'    would: delete user alias {a}')
+      return True
+    # Whether an address still resolves to this user is the only reliable
+    # signal: the aliases list endpoint lags deletions by minutes, and
+    # DELETE returns 400 "Invalid Input: resource_id" both for an alias
+    # that is already gone and for the just-renamed primary whose alias
+    # object has not materialized yet.
+    # propagation can take several minutes (observed: seconds to ~5 min)
+    attempts = 20
+    for attempt in range(attempts):
+      attached = []
+      for a in targets:
+        r = self.s.get(f'{DIR}/users/{a}')
+        if r.status_code == 200 and r.json().get('id') == uid:
+          attached.append(a)
+      if not attached:
+        return True
+      for a in attached:
+        r = self.s.delete(f'{DIR}/users/{uid}/aliases/{a}')
+        if r.status_code in (200, 204):
+          print(f'    done:  delete user alias {a}')
+      print(f'    ...addresses still resolving to the user: {attached}, '
+            f'retrying ({attempt + 1}/{attempts})')
+      time.sleep(15)
+    print(f'    FAIL:  could not remove user aliases: {attached}')
+    return False
 
   def create_group_with_retry(self, email, name, description):
     """The freed address can take a while to release after the alias
@@ -154,31 +199,39 @@ class Migrator:
       print(f'    ABORT: forward_to is not a single valid address: {target!r}')
       return False
 
-    # find the user account (under old or, if already renamed, new address)
+    # find the user account (under old or, if already renamed, new address;
+    # note a lookup by the old address can resolve via the auto-kept alias)
     r = self.s.get(f'{DIR}/users/{acct}')
-    renamed_already = False
-    if r.status_code == 404:
+    if r.status_code != 200:
+      # 404: no such user; 400: the address exists but is not a user
+      # (e.g. the group already created at it) - either way, look for
+      # the renamed account
       r = self.s.get(f'{DIR}/users/{new_email}')
-      if r.status_code == 200:
-        renamed_already = True
-        print(f'    note: account already renamed to {new_email}')
-      else:
+      if r.status_code != 200:
         print(f'    ABORT: no user account found at {acct} or {new_email}')
         return False
-    elif r.status_code != 200:
-      print(f'    ABORT: error fetching user {acct}: HTTP {r.status_code}')
-      return False
     user = r.json()
+    renamed_already = user['primaryEmail'].lower() == new_email
+    if renamed_already:
+      print(f'    note: account already renamed to {new_email}')
     uid = user['id']
     full_name = user.get('name', {}).get('fullName', local.replace('_', ' ').title())
 
     # merge the plan's aliases with the account's actual aliases (the plan
-    # only knows aliases that appeared as group members somewhere)
+    # only knows aliases that appeared as group members somewhere), and
+    # persist them to the plan BEFORE deleting anything - otherwise a
+    # failed run loses track of aliases that no longer exist on the user
     live_aliases = [a.lower() for a in user.get('aliases', [])]
+    found_new = False
     for a in live_aliases:
       if a not in aliases and a not in (acct, new_email):
         print(f'    note: found extra user alias {a}')
         aliases.append(a)
+        found_new = True
+    if found_new and self.execute and self.save_plan:
+      row['aliases'] = '; '.join(sorted(aliases))
+      self.save_plan()
+      print('    note: saved discovered aliases to the migration plan')
 
     # refuse to run if a non-group entity holds the address unexpectedly
     g = self.s.get(f'{DIR}/groups/{acct}')
@@ -195,12 +248,10 @@ class Migrator:
       ok &= self.write(f'rename user {acct} -> {new_email}', 'PUT',
                        f'{DIR}/users/{uid}', json={'primaryEmail': new_email})
 
-    # 2. strip the freed address + old aliases from the user
-    for a in [acct] + aliases:
-      ok &= self.write(f'delete user alias {a}', 'DELETE',
-                       f'{DIR}/users/{uid}/aliases/{a}',
-                       already_statuses=(404,))
-    if not ok:
+    # 2. strip the freed address + old aliases from the user. The old
+    # primary appears as an alias only shortly after the rename, and can
+    # briefly 400 as "Invalid Input: resource_id" before it does.
+    if not self.remove_user_aliases(uid, [acct] + aliases):
       print('    stopping: account not cleanly renamed/freed')
       return False
 
@@ -210,7 +261,8 @@ class Migrator:
     if self.execute:
       settings = self.get_template_settings()
       ok &= self.write(f'apply template settings from {TEMPLATE_GROUP}', 'PUT',
-                       f'{GSET}/{acct}?alt=json', json=settings)
+                       f'{GSET}/{acct}?alt=json', json=settings,
+                       retry_statuses=(404, 403))
     else:
       print(f'    would: apply template settings from {TEMPLATE_GROUP}')
 
@@ -218,13 +270,13 @@ class Migrator:
     ok &= self.write(f'add member {target}', 'POST',
                      f'{DIR}/groups/{acct}/members',
                      json={'email': target, 'role': 'MEMBER'},
-                     already_statuses=(409,))
+                     already_statuses=(409,), retry_statuses=(404, 403))
 
     # 5. add old aliases to the group
     for a in aliases:
       ok &= self.write(f'add group alias {a}', 'POST',
                        f'{DIR}/groups/{acct}/aliases', json={'alias': a},
-                       already_statuses=(409,))
+                       already_statuses=(409,), retry_statuses=(404, 403))
 
     # 6. subscribe the group everywhere the account was subscribed
     for p in parents:
@@ -244,13 +296,18 @@ class Migrator:
   def verify(self, group_email, target, aliases):
     r = self.s.get(f'{DIR}/groups/{group_email}/members')
     members = [m.get('email', '?') for m in r.json().get('members', [])]
-    g = self.s.get(f'{DIR}/groups/{group_email}').json()
-    print(f'    verify: members={members} aliases={g.get("aliases", [])}')
+    print(f'    verify: members={members}')
     if [m.lower() for m in members] != [target.lower()]:
       print('    verify: WARNING - members are not exactly the external address')
-    missing = set(aliases) - {a.lower() for a in g.get('aliases', [])}
-    if missing:
-      print(f'    verify: WARNING - missing aliases: {sorted(missing)}')
+    # check aliases by resolution; the aliases listing endpoint lags
+    for a in aliases:
+      g = self.s.get(f'{DIR}/groups/{a}')
+      resolved = g.json().get('email', '').lower() if g.status_code == 200 else None
+      if resolved != group_email:
+        print(f'    verify: WARNING - alias {a} does not resolve to the group '
+              f'(got {resolved or g.status_code})')
+      else:
+        print(f'    verify: alias {a} -> {group_email}')
 
 
 def main(argv):
@@ -283,8 +340,15 @@ def main(argv):
     if unknown:
       p.error(f'not in the migration plan (action=migrate): {unknown}')
 
+  def save_plan():
+    with open(PLAN_FILE, 'w', newline='') as f:
+      w = csv.DictWriter(f, fieldnames=list(plan[0].keys()))
+      w.writeheader()
+      w.writerows(plan)
+
   session = get_session()
-  m = Migrator(session, execute=args.execute, remove_user=args.remove_user)
+  m = Migrator(session, execute=args.execute, remove_user=args.remove_user,
+               save_plan=save_plan)
   if not args.execute:
     print('DRY RUN - re-run with --execute to make changes')
   results = {a: m.migrate(todo[a]) for a in selected}
