@@ -1,7 +1,18 @@
 # Repo specific files to ignore
 *.pickle
-groups.txt
-client_secrets.json
+groups*.txt
+contacts_export.csv
+migration_plan.csv
+config.json
+
+# Secrets and credentials
+client_secrets*.json
+*token*
+*credentials*
+*.key
+*.pem
+.env
+.env.*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

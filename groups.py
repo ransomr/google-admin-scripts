@@ -6,6 +6,9 @@ import os
 import pickle
 import sys
 
+with open('config.json') as _f:
+  DOMAIN = json.load(_f)['domain']
+
 import google_auth_oauthlib
 from google.auth.transport.requests import AuthorizedSession, Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -56,8 +59,8 @@ class Group:
     self.emails.update(aliases)
 
 def create_groups(session):
-  r = session.get('https://admin.googleapis.com/admin/directory/v1/groups', 
-                  params={'domain': 'newview.org', 'maxResults': 5000})
+  r = session.get('https://admin.googleapis.com/admin/directory/v1/groups',
+                  params={'domain': DOMAIN, 'maxResults': 5000})
   json_groups = r.json()['groups']
 
   groups = {}
@@ -71,7 +74,7 @@ def create_groups(session):
     elif direct_members == 1:
       r = session.get('https://admin.googleapis.com/admin/directory/v1/groups/{group_id}/members'.format(group_id=g['email']))
       json_member = r.json()['members'][0]
-      if 'newview.org' in json_member['email']:
+      if DOMAIN in json_member['email']:
         group.type = Group.GroupType.Alias
         group.members = {json_member['email']}
       else:
