@@ -1,4 +1,5 @@
 {
   "domain": "example.org",
-  "template_group": "template-person@example.org"
+  "template_group": "template-person@example.org",
+  "moderators": ["moderator1@example.com", "moderator2@example.com"]
 }

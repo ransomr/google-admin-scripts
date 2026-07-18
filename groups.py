@@ -7,7 +7,25 @@ import pickle
 import sys
 
 with open('config.json') as _f:
-  DOMAIN = json.load(_f)['domain']
+  _config = json.load(_f)
+DOMAIN = _config['domain']
+# addresses that act as list moderators; their MANAGER memberships are
+# administrative and hidden from listings
+MODERATORS = {m.lower() for m in _config.get('moderators', [])}
+
+
+def include_member(member):
+  """False for administrative memberships that should not be listed:
+  moderator MANAGER rows and renamed _user accounts."""
+  email = member.get('email', '')
+  if not email:
+    return False
+  local, _, domain = email.lower().partition('@')
+  if domain == DOMAIN and local.endswith('_user'):
+    return False
+  if member.get('role') == 'MANAGER' and email.lower() in MODERATORS:
+    return False
+  return True
 
 import google_auth_oauthlib
 from google.auth.transport.requests import AuthorizedSession, Request
@@ -69,16 +87,24 @@ def create_groups(session):
       continue
     group = Group(g)
     direct_members = int(g['directMembersCount'])
-    if direct_members > 1:
+    # moderator/administrative memberships must not affect classification,
+    # so for small groups classify on the filtered member list (at most 2
+    # moderators exist, so >3 direct members always means a real Group)
+    if direct_members > 3:
       group.type = Group.GroupType.Group
-    elif direct_members == 1:
+    elif direct_members > 0:
       r = session.get('https://admin.googleapis.com/admin/directory/v1/groups/{group_id}/members'.format(group_id=g['email']))
-      json_member = r.json()['members'][0]
-      if DOMAIN in json_member['email']:
-        group.type = Group.GroupType.Alias
-        group.members = {json_member['email']}
-      else:
-        group.type = Group.GroupType.User
+      json_members = [m for m in r.json().get('members', []) if include_member(m)]
+      if len(json_members) > 1:
+        group.type = Group.GroupType.Group
+      elif len(json_members) == 1:
+        json_member = json_members[0]
+        if DOMAIN in json_member['email']:
+          group.type = Group.GroupType.Alias
+          group.members = {json_member['email']}
+        else:
+          group.type = Group.GroupType.User
+      # 0 real members: leave as Unknown (not listed)
     groups[g['email']] = group
   return groups
 
@@ -107,6 +133,8 @@ def list_group_members(session, groups, group):
   r = session.get('https://admin.googleapis.com/admin/directory/v1/groups/{group_id}/members'.format(group_id=group.email))
   json_members = r.json()['members']
   for member in json_members:
+    if not include_member(member):
+      continue
     member_email = member['email']
     if member_email in groups:
       target_group = groups[member_email]

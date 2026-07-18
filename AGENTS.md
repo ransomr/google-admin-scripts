@@ -76,6 +76,16 @@ the domain — the repo is public.
   people. The domain's `everyone@` group worked this way and was deleted
   July 2026 for that reason.
 - Gmail ignores dots in addresses: `a.b@gmail.com` == `ab@gmail.com`.
+- Group auto-reply settings are UI-only (Groups UI → Group settings →
+  Email options → Auto replies) and completely invisible to the Groups
+  Settings API. An empty group may still be a deliberate auto-responder
+  for a retired address -- test with a real email before calling it a
+  blackhole or deleting it.
+- The admin API can add external members even to groups with
+  `allowExternalMembers: false`.
+- Moderator MANAGER rows change `directMembersCount`; anything that
+  classifies groups by member count must filter them out first (see
+  `include_member` in groups.py).
 
 ## Background: why the migration
 
