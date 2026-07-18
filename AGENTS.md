@@ -71,8 +71,10 @@ the domain — the repo is public.
 - `users.list` needs a user scope the read-only token lacks; the domain
   user inventory in scripts here is inferred from group memberships, so
   accounts in no groups are invisible to it.
-- The `everyone@` group contains all domain users via a CUSTOMER member;
-  migrated (group-based) people are NOT in it automatically.
+- A group can contain the entire organization via a special CUSTOMER-type
+  member; such groups reach only real accounts, NOT migrated (group-based)
+  people. The domain's `everyone@` group worked this way and was deleted
+  July 2026 for that reason.
 - Gmail ignores dots in addresses: `a.b@gmail.com` == `ab@gmail.com`.
 
 ## Background: why the migration

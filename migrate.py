@@ -311,6 +311,9 @@ class Migrator:
 
 
 def main(argv):
+  # line-buffer stdout even when piped (e.g. through tee), so progress
+  # is visible in real time
+  sys.stdout.reconfigure(line_buffering=True)
   p = argparse.ArgumentParser(description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument('command', choices=['list', 'migrate'])
